@@ -1,6 +1,7 @@
 // The video and its subtitle layer move into the mini player window (another document) and back, so they are
 // looked up once and kept.
 const pinnedElements=new Map();
+// 캐시 초기화 관리 매니저
 const $ = s => { if(s==='#video'||s==='#videoStage'){if(!pinnedElements.has(s))pinnedElements.set(s,document.querySelector(s));return pinnedElements.get(s)} return document.querySelector(s); };
 const $$ = s => [...document.querySelectorAll(s)];
 const SPEED_OPTIONS=[.1,.25,.5,.75,1,1.25,1.5,1.75,2,3,4];
@@ -29,63 +30,129 @@ const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
 // 현재 재생 중인 회차의 확정된 전체 듀레이션
 let currentActiveDuration = 0;
 
-// 사용자가 캐시 범위를 벗어난 곳으로 시킹할 때, 누락된 .ts 조각을 동적으로 주입하기 위해 사용됩니다.
+// HlsCacheManager (작품/회차 전환 시 캐시 및 메모리 생명주기 관리)
+const HlsCacheManager = {
+  ttlTimer: null,
+  animeIdOnExit: null,
+  episodeRefOnExit: null,
+
+  // 상세 페이지 이탈 후 60초 경과 시 메모리 및 버퍼 일괄 정리 (메모리 누수 방지)
+  performDeepCleanup() {
+    cacheSessionId++;
+    if (cacheAbortController) {
+      cacheAbortController.abort();
+      cacheAbortController = null;
+    }
+
+    if (activeSourceBuffer) {
+      try {
+        if (activeSourceBuffer.updating) {
+          activeSourceBuffer.abort();
+        }
+        
+        if (activeSourceBuffer.buffered && activeSourceBuffer.buffered.length > 0) {
+          const start = activeSourceBuffer.buffered.start(0);
+          const end = activeSourceBuffer.buffered.end(activeSourceBuffer.buffered.length - 1);
+          if (end > start) {
+            activeSourceBuffer.remove(start, end);
+          }
+        }
+      } catch (e) {
+        console.warn('[HLS Cache Manager] SourceBuffer cleanup warning:', e);
+      }
+      activeSourceBuffer = null;
+    }
+
+    if (activeBlobUrl) {
+      URL.revokeObjectURL(activeBlobUrl);
+      activeBlobUrl = null;
+    }
+    if (activeMediaSourceUrl) {
+      URL.revokeObjectURL(activeMediaSourceUrl);
+      activeMediaSourceUrl = null;
+    }
+
+    videoCache.clear();
+    totalCacheBytes = 0;
+    cacheTriggeredForEpisode = null;
+    cachingProgressText = '대기 중';
+    
+    this.clearTtlState();
+  },
+
+  clearTtlState() {
+    this.animeIdOnExit = null;
+    this.episodeRefOnExit = null;
+    if (this.ttlTimer) {
+      clearTimeout(this.ttlTimer);
+      this.ttlTimer = null;
+    }
+  },
+
+  handleExit() {
+    cacheSessionId++;
+    if (cacheAbortController) {
+      cacheAbortController.abort();
+      cacheAbortController = null;
+    }
+
+    const currentContext = currentPlaybackContext || {};
+    const anime = currentContext.anime || {};
+    this.animeIdOnExit = anime.id || anime.mal_id || anime.provider || 'unknown';
+    this.episodeRefOnExit = currentContext.episode ? episodeRef(currentContext.episode) : null;
+
+    if (this.ttlTimer) {
+      clearTimeout(this.ttlTimer);
+      this.ttlTimer = null;
+    }
+
+    this.ttlTimer = setTimeout(() => {
+      this.performDeepCleanup();
+    }, 60000);
+  },
+
+  validateOnEnter(newContext) {
+    if (totalCacheBytes > MAX_CACHE_BYTES) {
+      this.performDeepCleanup();
+      return;
+    }
+
+    if (this.ttlTimer && this.animeIdOnExit) {
+      const newAnime = newContext.anime || {};
+      const newAnimeId = newAnime.id || newAnime.mal_id || newAnime.provider || 'unknown';
+      const newEpisodeRef = newContext.episode ? episodeRef(newContext.episode) : null;
+
+      if (newAnimeId !== this.animeIdOnExit || newEpisodeRef !== this.episodeRefOnExit) {
+        this.performDeepCleanup();
+      } else {
+        this.clearTtlState();
+      }
+    }
+  }
+};
+
 let activeSourceBuffer = null;
-// 이미 네트워크에서 뒷단 데이터를 가져오는 중일 때 중복으로 요청이 폭증하는 것을 막아줍니다.
 let isFetchingGap = false;
 
-// 메모리 캐싱 및 로그 관련 전역 변수
 const videoCache = new Map();
-let lastPlayedAnimeId = null; // 현재 시청 중인 작품 ID 추적용
-let activeBlobUrl = null; // 현재 재생 중인 캐시 Blob URL 추적용
+let lastPlayedAnimeId = null; 
+let activeBlobUrl = null; 
+let activeMediaSourceUrl = null; 
 let totalCacheBytes = 0;
-// 모바일이면 탭 크래시(OOM) 방지를 위해 한도를 낮추고, PC면 기존 설정 유지
-const MAX_CACHE_BYTES = isMobile ? 200 * 1024 * 1024 : 450 * 1024 * 1024; // PC: 450MB / 모바일: 200MB
-const MAX_EPISODE_BYTES = isMobile ? 70 * 1024 * 1024 : 150 * 1024 * 1024;  // PC: 150MB / 모바일: 70MB
+const MAX_CACHE_BYTES = isMobile ? 200 * 1024 * 1024 : 450 * 1024 * 1024; 
+const MAX_EPISODE_BYTES = isMobile ? 70 * 1024 * 1024 : 150 * 1024 * 1024;  
 let cacheTriggeredForEpisode = null;
 let cachingProgressText = '대기 중';
 
-// 백그라운드 캐시 다운로드 중단을 위한 컨트롤러 및 세션 ID
 let cacheAbortController = null;
 let cacheSessionId = 0;
 
 function clearVideoCache() {
-  // 1. 진행 중인 백그라운드 다운로드 세션 무효화 및 네트워크 요청 중단
-  cacheSessionId++;
-  if (cacheAbortController) {
-    cacheAbortController.abort();
-    cacheAbortController = null;
-  }
-
-  // [추가] 현재 재생 중이던 Blob URL의 메모리를 즉시 해제
-  if (activeBlobUrl) {
-    URL.revokeObjectURL(activeBlobUrl);
-    activeBlobUrl = null;
-  }
-
-  // 2. 캐시 데이터 및 상태 완전 초기화
-  videoCache.clear();
-  totalCacheBytes = 0;
-  cacheTriggeredForEpisode = null;
-  cachingProgressText = '대기 중';
-}
-
-function clearVideoCache() {
-  // 1. 진행 중인 백그라운드 다운로드 세션 무효화 및 네트워크 요청 중단
-  cacheSessionId++;
-  if (cacheAbortController) {
-    cacheAbortController.abort();
-    cacheAbortController = null;
-  }
-
-  // 2. 캐시 데이터 및 상태 완전 초기화
-  videoCache.clear();
-  totalCacheBytes = 0;
-  cacheTriggeredForEpisode = null;
-  cachingProgressText = '대기 중';
+  HlsCacheManager.performDeepCleanup();
 }
 
 async function fetchNextEpisodeData(episode) {
+  // 세션 ID를 증가시켜 이전의 구형 캐시 다운로드 요청을 즉시 무효화 (Race Condition 방어)
   const currentSession = ++cacheSessionId;
   cacheAbortController = new AbortController();
   const signal = cacheAbortController.signal;
@@ -110,11 +177,10 @@ async function fetchNextEpisodeData(episode) {
 
     const text = await response.text();
     let combinedBlob;
-    let calculatedDuration = 0; // [.m3u8 기반 전체 재생 시간]
+    let calculatedDuration = 0;
     
-    // 온디맨드 시킹/버퍼 홀 대응을 위한 세그먼트 메타데이터 변수
     let accumulatedTime = 0;
-    let currentSegDuration = 2; // 기본 듀레이션 폴백
+    let currentSegDuration = 2;
     const segments = []; 
 
     if (text.includes('#EXTM3U') || /\.m3u8/i.test(stream.url)) {
@@ -123,7 +189,6 @@ async function fetchNextEpisodeData(episode) {
       const segmentUrls = [];
       const baseUrl = stream.url.substring(0, stream.url.lastIndexOf('/') + 1);
 
-      // .m3u8 파일의 모든 #EXTINF 값을 합산하여 정확한 전체 듀레이션 산출 및 세그먼트 매핑
       for (let i = 0; i < lines.length; i++) {
         const line = lines[i].trim();
         if (line.startsWith('#EXTINF:')) {
@@ -131,7 +196,7 @@ async function fetchNextEpisodeData(episode) {
           const segDuration = parseFloat(durationStr);
           if (!isNaN(segDuration)) {
             calculatedDuration += segDuration;
-            currentSegDuration = segDuration; // 파싱된 실제 듀레이션 반영
+            currentSegDuration = segDuration;
           }
         }
         
@@ -139,7 +204,6 @@ async function fetchNextEpisodeData(episode) {
           const segUrl = line.startsWith('http') ? line : baseUrl + line;
           segmentUrls.push(segUrl);
           
-          // 각 조각별 시작/끝 타임스탬프 기록
           segments.push({
             url: segUrl,
             start: accumulatedTime,
@@ -154,50 +218,62 @@ async function fetchNextEpisodeData(episode) {
         return;
       }
 
-      cachingProgressText = `HLS 조각 다운로드 중 (0/${segmentUrls.length})...`;
-      const segmentBlobs = [];
-      let count = 0;
+      cachingProgressText = `HLS 조각 병렬 다운로드 중 (0/${segmentUrls.length})...`;
+      
+      const segmentBlobs = new Array(segmentUrls.length);
+      let downloadedCount = 0;
       let currentDownloadBytes = 0;
       let isCappedAt150MB = false;
+      const CONCURRENCY_LIMIT = 4; // 동시에 최대 4개씩 병렬 청크 다운로드
 
-      // 150MB 제한을 지켜 앞부분 조각들만 수집
-      for (const segUrl of segmentUrls) {
-        if (currentSession !== cacheSessionId) return;
-        
-        if (currentDownloadBytes >= MAX_EPISODE_BYTES) {
-          isCappedAt150MB = true;
-          break;
-        }
+      for (let i = 0; i < segmentUrls.length; i += CONCURRENCY_LIMIT) {
+        if (currentSession !== cacheSessionId || signal.aborted || isCappedAt150MB) break;
 
-        try {
-          const segRes = await fetch(segUrl, { headers, signal });
-          if (segRes.ok) {
-            const segBlob = await segRes.blob();
-            
-            if (currentDownloadBytes + segBlob.size > MAX_EPISODE_BYTES) {
-              isCappedAt150MB = true;
-              break;
-            }
-
-            segmentBlobs.push(segBlob);
-            currentDownloadBytes += segBlob.size;
+        const chunkSlice = segmentUrls.slice(i, i + CONCURRENCY_LIMIT);
+        const batchPromises = chunkSlice.map(async (segUrl, sliceIndex) => {
+          if (currentSession !== cacheSessionId || signal.aborted) return;
+          
+          if (currentDownloadBytes >= MAX_EPISODE_BYTES) {
+            isCappedAt150MB = true;
+            return;
           }
-        } catch (e) {}
-        count++;
-        
-        const estimatedTotal = totalCacheBytes + currentDownloadBytes;
-        const estimatedMB = (estimatedTotal / 1024 / 1024).toFixed(1);
-        cachingProgressText = `다운로드 중 (${count}/${segmentUrls.length}) - ${estimatedMB}MB${isCappedAt150MB ? ' (150MB 제한 도달)' : ''}`;
+
+          try {
+            const segRes = await fetch(segUrl, { headers, signal });
+            
+            if (currentSession !== cacheSessionId || signal.aborted) return;
+
+            if (segRes.ok) {
+              const segBlob = await segRes.blob();
+              
+              if (currentSession !== cacheSessionId || signal.aborted) return;
+
+              if (currentDownloadBytes + segBlob.size > MAX_EPISODE_BYTES) {
+                isCappedAt150MB = true;
+                return;
+              }
+              segmentBlobs[i + sliceIndex] = segBlob;
+              currentDownloadBytes += segBlob.size;
+            }
+          } catch (e) {
+            if (e.name !== 'AbortError') {
+              console.warn('[Cache] Segment fetch warning:', e);
+            }
+          }
+
+          downloadedCount++;
+          const estimatedTotal = totalCacheBytes + currentDownloadBytes;
+          const estimatedMB = (estimatedTotal / 1024 / 1024).toFixed(1);
+          cachingProgressText = `병렬 다운로드 중 (${downloadedCount}/${segmentUrls.length}) - ${estimatedMB}MB${isCappedAt150MB ? ' (150MB 제한 도달)' : ''}`;
+        });
+
+        await Promise.all(batchPromises);
       }
 
       if (currentSession !== cacheSessionId) return;
-      
-      // 150MB 앞부분 블롭 생성
-      let rawBlob = new Blob(segmentBlobs, { type: 'video/mp4' });
-      if (rawBlob.size > MAX_EPISODE_BYTES) {
-        rawBlob = rawBlob.slice(0, MAX_EPISODE_BYTES, 'video/mp4');
-      }
-      combinedBlob = rawBlob;
+
+      const validSegmentBlobs = segmentBlobs.filter(Boolean);
+      combinedBlob = new Blob(validSegmentBlobs, { type: 'video/mp2t' });
 
     } else {
       const directRes = await fetch(stream.url, { headers, signal });
@@ -213,8 +289,6 @@ async function fetchNextEpisodeData(episode) {
 
     const size = combinedBlob.size;
     const epRef = episodeRef(episode);
-
-    // 글로벌 450MB 캐시 관리 및 현재 시청 중인 회차 보호
     const currentPlayingRef = currentPlaybackContext.episode ? episodeRef(currentPlaybackContext.episode) : null;
 
     while (totalCacheBytes + size > MAX_CACHE_BYTES && videoCache.size > 0) {
@@ -235,26 +309,24 @@ async function fetchNextEpisodeData(episode) {
 
     if (currentSession !== cacheSessionId) return;
 
-// 캐시 저장소에 Blob 뿐만 아니라 계산된 duration, 원본 stream.url, 그리고 segments 메타데이터 함께 보관
     videoCache.set(epRef, { 
       size, 
       blob: combinedBlob, 
+      segmentBlobs: typeof validSegmentBlobs !== 'undefined' ? validSegmentBlobs : [combinedBlob], 
       duration: calculatedDuration, 
       streamUrl: stream.url, 
       headers,
-      segments // 온디맨드 버퍼 펠러(Gap Filler)에서 사용할 세그먼트 매핑 정보
+      segments 
     });
     
     totalCacheBytes += size;
     
     const finalMB = (size / 1024 / 1024).toFixed(1);
     cachingProgressText = `캐싱 완료 (${finalMB}MB${size >= MAX_EPISODE_BYTES ? ' [150MB 제한 적용됨]' : ''})`;
-    refreshCacheMonitor(cachingProgressText, 80);
 
   } catch (e) {
     if (e.name === 'AbortError') return;
     cachingProgressText = `캐싱 실패: ${e.message}`;
-    refreshCacheMonitor(cachingProgressText, 80);
   }
 }
 
@@ -479,17 +551,15 @@ function renderDownloads(){seedDownloadTitles();const list=$('#downloadList'),co
   $('#emptyDownloads').classList.toggle('hidden',state.downloads.length>0);refreshEpisodeDownloadButtons()}
 function renderLibrary(){$('#libraryCount').textContent=String(state.library.length);if(typeof catalogUpdateUI!=='undefined')catalogUpdateUI.renderLibrary();else renderCards('#libraryGrid',state.library);$('#emptyLibrary').classList.toggle('hidden',state.library.length>0);renderDownloads();}
 function episodeDownloadJob(anime,episode){return state.downloads.find(job=>job.key===`${anime.mal_id||anime.id}:${episode.provider||'provider'}:${episode.url||episode.token||episode.id||episode.number}`)}
-//작품 간 캐시 섞임 방지
+//작품 및 회차별 고유 캐시 키 생성 (오염 방지)
 function episodeRef(episode) {
   const epKey = encodeURIComponent(String(episode.url || episode.token || episode.id || episode.number || ''));
   const anime = currentPlaybackContext?.anime || {};
   
-  // 작품 ID, 제공처, 시즌 태그까지 결합하여 기수/시즌 간 충돌 원천 방어
   const animeId = anime.id || anime.mal_id || anime.provider || 'unknown';
   const provider = anime.provider || currentPlaybackContext.episode?.provider || 'provider';
   const seasonTag = episode.seasonId || anime.season || '';
   
-  // 작품 ID가 있으면 앞에 붙여주고, 없으면 기존 원본 그대로 반환
   return `${provider}_${animeId}_${seasonTag}_${epKey}`;
 }
 // Linkkf episodes saved before they carried a number (history, downloads) only have their name ("12", "12화").
@@ -703,8 +773,10 @@ async function resolveWithVideoServer(episode,koreanSearch,anime){
   return window.lilac.providerResolve({...episode,server:picked,prefer});
 }
 async function resolveIntoPlayer(resolver, name, context={}, subtitleTitle='', episode=1){
-  const requestId=showPendingPlayer(name,context);
-  const searchTitle=subtitleTitle||context.subtitleTitle||name.split(' · ')[0];
+  // 진입 시 TTL 캐시 유효성 검사 및 메모리 정리
+  HlsCacheManager.validateOnEnter(context);
+  const requestId = showPendingPlayer(name, context);
+  const searchTitle = subtitleTitle || context.subtitleTitle || name.split(' · ')[0];
 
   // 오프라인 및 메모리 캐시 대응
   if (context.episode) {
@@ -713,33 +785,27 @@ async function resolveIntoPlayer(resolver, name, context={}, subtitleTitle='', e
       if (requestId !== playbackRequestId) return;
       const cached = videoCache.get(epRef);
       
-      // 캐시된 전체 듀레이션을 확정하여 타임라인을 온전하게 유지
       currentActiveDuration = cached.duration || 0;
       
-      const blobUrl = URL.createObjectURL(cached.blob); // Blob을 브라우저 재생 URL로 변환
+      const blobUrl = URL.createObjectURL(cached.blob);
       
-      // 1. 이전 활성 Blob URL 메모리 해제 후 갱신
       if (activeBlobUrl) {
         URL.revokeObjectURL(activeBlobUrl);
       }
       activeBlobUrl = blobUrl;
       
-      // 2. 플레이어 상태 컨텍스트 갱신
       currentPlaybackContext = { ...context, currentUrl: blobUrl, offline: true };
       
-      // 이전 HLS 플레이어가 있다면 파괴해서 충돌 방지
       if (typeof hlsPlayer !== 'undefined' && hlsPlayer) {
         hlsPlayer.destroy();
         hlsPlayer = null;
       }
 
-      // 플레이어 화면 활성화 및 컨트롤러 세팅
       if (typeof enterPlayer === 'function') enterPlayer();
       if (typeof setPlayerLocked === 'function') setPlayerLocked(false);
       if (typeof showPlayerControls === 'function') showPlayerControls();
       if (typeof updateEpisodeButtons === 'function') updateEpisodeButtons();
       
-      // 3. MediaSource (MSE)를 이용한 원시 .ts 바이너리 직접 버퍼링 재생
       const video = $('#video');
       if (video) {
         video.removeAttribute('src');
@@ -749,92 +815,77 @@ async function resolveIntoPlayer(resolver, name, context={}, subtitleTitle='', e
         }
 
         try {
-          console.log('[Cache Play] MediaSource 재생 시도, 데이터 크기:', cached.blob.size);
-
           if ('MediaSource' in window) {
             const mediaSource = new MediaSource();
-            video.src = URL.createObjectURL(mediaSource);
+            if (activeMediaSourceUrl) {
+              URL.revokeObjectURL(activeMediaSourceUrl);
+            }
+            activeMediaSourceUrl = URL.createObjectURL(mediaSource);
+            video.src = activeMediaSourceUrl;
 
             mediaSource.addEventListener('sourceopen', async () => {
+              if (requestId !== playbackRequestId) return;
               try {
-                // 브라우저가 지원하는 MPEG-TS 미디어소스 타입 확인
                 const mimeType = 'video/mp2t; codecs="avc1.42E01E, mp4a.40.2"';
                 const fallbackMime = 'video/mp2t';
                 const targetMime = MediaSource.isTypeSupported(mimeType) ? mimeType : fallbackMime;
 
                 if (!MediaSource.isTypeSupported(targetMime)) {
-                  throw new Error(`MediaSource가 해당 포맷(${targetMime})을 지원하지 않습니다.`);
+                  throw new Error(`MediaSource format not supported: ${targetMime}`);
                 }
 
+                if (requestId !== playbackRequestId) return;
                 const sourceBuffer = mediaSource.addSourceBuffer(targetMime);
 
-                // 온디맨드 버퍼 펠러
-                // 추후 사용자가 캐시 범위를 벗어난 곳으로 시킹(점프)할 때, 
-                // 이 버퍼에 누락된 .ts 조각을 실시간으로 주입할 수 있도록 전역 변수에 바인딩합니다.
                 activeSourceBuffer = sourceBuffer;
 
-                // 브라우저 MSE 엔진에 실제 전체 재생 시간(duration)을 명시적으로 설정합니다.
-                // 이 설정이 없으면 5분짜리 150MB 캐시 끝에 도달했을 때 브라우저가 영상을 끝난 것으로 오인하여
-                // 'ended' 이벤트를 뿜어내고 곧바로 다음 화로 넘어가 버리는 오동작이 발생합니다.
                 if (cached.duration && cached.duration > 0) {
                   try {
                     mediaSource.duration = cached.duration;
                   } catch (e) {
-                    console.warn('[Cache Play] MediaSource duration 설정 실패:', e);
+                    console.warn('[Cache Play] MediaSource duration warning:', e);
                   }
                 }
 
                 const arrayBuffer = await cached.blob.arrayBuffer();
+                if (requestId !== playbackRequestId) return;
 
                 sourceBuffer.appendBuffer(arrayBuffer);
                 sourceBuffer.addEventListener('updateend', () => {
+                  if (requestId !== playbackRequestId) return;
                   if (!sourceBuffer.updating && mediaSource.readyState === 'open') {
-                    // endOfStream()을 호출하면 브라우저는 스트림이 끝났다고 판단하므로 호출하지 않습니다.
-                    // 온디맨드 갭 필터가 필요할 때마다 뒷단 데이터를 계속 이어 붙일 수 있도록 스트림을 열어둡니다.
-                    // mediaSource.endOfStream(); 
-
                     video.play().catch(err => {
-                      console.warn('[Cache Play] 재생 지연 또는 차단:', err);
+                      console.warn('[Cache Play] Playback deferred or blocked:', err);
                     });
                   }
                 });
               } catch (e) {
-                console.error('[Cache Play] 미디어 버퍼 주입 실패:', e);
+                if (requestId !== playbackRequestId) return;
+                console.error('[Cache Play] Buffer injection failed:', e);
                 alert(`미디어 버퍼 에러: ${e.message}`);
               }
             });
           } else {
-            throw new Error('이 환경에서는 MediaSource를 지원하지 않습니다.');
+            throw new Error('MediaSource is not supported in this environment.');
           }
 
         } catch (err) {
-          console.error('[Cache Play] 초기화 예외 발생:', err);
+          console.error('[Cache Play] Initialization error:', err);
           alert(`재생 초기화 에러: ${err.message}`);
         }
       }
       
-      // 4. UI 상태 및 자막/메타데이터 후속 처리
       $('#downloadStatus').textContent = '메모리 캐시에서 즉시 재생 중 (오프라인 대응)';
       $('#playerTitle').textContent = name;
       if (typeof updatePlayerTitle === 'function') updatePlayerTitle();
       
       $('#playerMeta').textContent = context.episode ? (episodeNumberOf(context.episode) ? `${episodeNumberOf(context.episode)}화` : episodeTitle(context.episode)) : 'LilacAnime';
       
-      // 로딩 빈 화면 숨기기
       if ($('#playerEmpty')) {
         $('#playerEmpty').classList.add('hidden');
       }
       
-      // 자막 리스트 로드
       if (typeof loadJimakuList === 'function') loadJimakuList();
-      
-      // 다른 비동기 이벤트가 상태 텍스트를 덮어쓰는 것을 한 번 더 방어
-      setTimeout(() => {
-        const statusEl = $('#downloadStatus');
-        if (statusEl && statusEl.textContent.includes('연결')) {
-          statusEl.textContent = '메모리 캐시에서 즉시 재생 중 (오프라인 대응)';
-        }
-      }, 200);
 
       return;
     }
@@ -860,53 +911,78 @@ async function resolveIntoPlayer(resolver, name, context={}, subtitleTitle='', e
   }
 }
 
-function play(src,name='직접 재생',context={}) {
+function play(src, name = '직접 재생', context = {}) {
   ++playbackRequestId;
-  // play 함수 진입 시점의 듀레이션 상태 바인딩
+  
+  // 캐시된 전체 듀레이션이 존재하면 우선 바인딩
   const epRef = context.episode ? episodeRef(context.episode) : null;
   const cached = epRef ? videoCache.get(epRef) : null;
   currentActiveDuration = cached?.duration || 0; 
-  // (캐시가 있으면 해당 회차의 전체 듀레이션으로 세팅, 없으면 0으로 초기화하여 기본 로직 사용)
-  // 이전 캐시 Blob URL이 존재한다면 메모리에서 해제(Revoke)
+  
   if (activeBlobUrl) {
     URL.revokeObjectURL(activeBlobUrl);
     activeBlobUrl = null;
   }
-  // 다른 작품(B)으로 넘어왔을 때만 이전 작품(A)의 캐시를 완전히 청소
+  
+  // 다른 작품으로 전환될 때만 이전 작품의 캐시 전체 정리
   const currentAnimeId = context.anime?.id || context.anime?.provider || 'unknown';
   if (lastPlayedAnimeId && lastPlayedAnimeId !== currentAnimeId) {
     clearVideoCache();
   }
   lastPlayedAnimeId = currentAnimeId;
 
-  // 기존 백그라운드 다운로드 중단 처리
+  // 백그라운드 사전 캐시 다운로드 중단 처리
   if (cacheAbortController) {
     cacheAbortController.abort();
     cacheAbortController = null;
   }
-  // 새 영상/회차가 재생될 때 이전 캐시 트리거 상태 초기화 cacheTriggeredForEpisode
-  cacheTriggeredForEpisode = null;resetAutoSkipState();const video=$('#video');currentPlaybackContext={...context,currentUrl:src};cancelOtherEpisodeTranslations();clearSubtitle();renderSubtitleSheet();skipSegments=[];activeSkip=null;activeSkipKey=null;opEdAnalysisKey=null;if(hlsPlayer){hlsPlayer.destroy();hlsPlayer=null;} video.removeAttribute('src');
-  enterPlayer();setPlayerLocked(false);showPlayerControls();updateEpisodeButtons();$('#playerEmpty').classList.remove('hidden');$('#subtitleState').textContent='온라인 자막을 확인하는 중...';
-  // blob URL인 경우(캐시 재생)는 Hls.js를 거치지 않고 바로 일반 비디오로 재생
+  
+  cacheTriggeredForEpisode = null;
+  resetAutoSkipState();
+  
+  const video = $('#video');
+  currentPlaybackContext = { ...context, currentUrl: src };
+  cancelOtherEpisodeTranslations();
+  clearSubtitle();
+  renderSubtitleSheet();
+  skipSegments = [];
+  activeSkip = null;
+  activeSkipKey = null;
+  opEdAnalysisKey = null;
+  
+  if (hlsPlayer) {
+    hlsPlayer.destroy();
+    hlsPlayer = null;
+  } 
+  video.removeAttribute('src');
+  
+  enterPlayer();
+  setPlayerLocked(false);
+  showPlayerControls();
+  updateEpisodeButtons();
+  $('#playerEmpty').classList.remove('hidden');
+  $('#subtitleState').textContent = '온라인 자막을 확인하는 중...';
+  
   const isBlob = /^blob:/i.test(src);
-  const isHls = !isBlob && (/\.m3u8(?:$|\?)/i.test(src)||/\/__flix\//i.test(src)||Boolean(context.hls));
-  if(isHls&&window.Hls?.isSupported()){
-    hlsPlayer=new Hls({
-      enableWorker:true,
-      lowLatencyMode:false,
-      startFragPrefetch:true,
-      maxBufferLength:60,
-      maxMaxBufferLength:60,
-      maxBufferSize:1024*1024*1024,
-      backBufferLength:10,
-      maxBufferHole:.5,
-      highBufferWatchdogPeriod:2,
-      manifestLoadingTimeOut:120000,
-      levelLoadingTimeOut:120000,
-      fragLoadingTimeOut:120000,
-      manifestLoadingMaxRetry:6,
-      levelLoadingMaxRetry:6,
-      fragLoadingMaxRetry:6
+  const isHls = !isBlob && (/\.m3u8(?:$|\?)/i.test(src) || /\/__flix\//i.test(src) || Boolean(context.hls));
+  
+  if (isHls && window.Hls?.isSupported()) {
+    hlsPlayer = new Hls({
+      enableWorker: true,
+      lowLatencyMode: false,
+      startFragPrefetch: true,
+      maxBufferLength: 60,
+      maxMaxBufferLength: 60,
+      maxBufferSize: 1024 * 1024 * 1024,
+      backBufferLength: 10,
+      maxBufferHole: .5,
+      highBufferWatchdogPeriod: 2,
+      manifestLoadingTimeOut: 120000,
+      levelLoadingTimeOut: 120000,
+      fragLoadingTimeOut: 120000,
+      manifestLoadingMaxRetry: 6,
+      levelLoadingMaxRetry: 6,
+      fragLoadingMaxRetry: 6
     });
     hlsPlayer.loadSource(src);
     hlsPlayer.attachMedia(video);
@@ -1318,7 +1394,7 @@ const translateShown=provider=>{const kind=translatableSubtitle(),button=provide
 $('#translateNow').onclick=event=>cancelButtonRun(event.currentTarget)||translateShown('cloud');$('#translateNowLocal').onclick=event=>cancelButtonRun(event.currentTarget)||translateShown('local');
 // A jump while the subtitle on screen is translated: its run translates from there next.
 $('#video').addEventListener('seeked',()=>{if(translating?.path&&translatingNow())window.lilac.jumpTranslation(translating.run,$('#video').currentTime||0).catch(()=>{})});
-// 하이브리드 스트리밍 및 고해상도 UX 캐시 밖 시킹 시 Hls.js 초고속 전환 및 프레임 캡처 오버레이
+// 캐시 이탈 시 HLS 전환 (플래시 방지용 스냅샷 오버레이)
 $('#video').addEventListener('seeking', async () => {
   const videoEl = $('#video');
   const currentEp = currentPlaybackContext.episode;
@@ -1331,7 +1407,7 @@ $('#video').addEventListener('seeking', async () => {
 
   const targetTime = videoEl.currentTime;
 
-  // 1. 현재 targetTime이 150MB 캐시 범위 내에 있는지 확인
+  // 이미 메모리(Buffer)에 로드되어 있는 구간인지 확인
   let isBuffered = false;
   for (let i = 0; i < videoEl.buffered.length; i++) {
     if (targetTime >= videoEl.buffered.start(i) && targetTime <= videoEl.buffered.end(i)) {
@@ -1340,11 +1416,11 @@ $('#video').addEventListener('seeking', async () => {
     }
   }
 
-  // 2. 캐시 범위를 벗어난 곳으로 시킹한 경우
+  // 캐시되지 않은 외부 구간으로 시킹한 경우 온라인 스트리밍으로 전환
   if (!isBuffered) {
     $('#downloadStatus').textContent = '온라인 스트리밍 구간 연결 중...';
     
-    // 고해상도(원본 기준, 기본 1080p) 프레임 캡처 캔버스 생성 및 오버레이 (가변 반응형 적용)
+    // 버퍼 전환 중 화면 깜빡임(Flash) 방지를 위한 현재 프레임 스냅샷 캔버스 캡처
     const snapshotCanvas = document.createElement('canvas');
     snapshotCanvas.width = videoEl.videoWidth || videoEl.clientWidth || 1920;
     snapshotCanvas.height = videoEl.videoHeight || videoEl.clientHeight || 1080;
@@ -1352,15 +1428,20 @@ $('#video').addEventListener('seeking', async () => {
     try {
       ctx.drawImage(videoEl, 0, 0, snapshotCanvas.width, snapshotCanvas.height);
     } catch (e) {
-      console.warn('[Snapshot] 프레임 캡처 실패:', e);
+      console.warn('[Snapshot] Frame capture warning:', e);
     }
 
     snapshotCanvas.style.cssText = 'position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: contain; z-index: 20; pointer-events: none; background: #000;';
     const playerContainer = $('#immersivePlayer') || videoEl.parentElement;
     playerContainer.appendChild(snapshotCanvas);
 
+    const cleanupSnapshot = () => {
+      if (snapshotCanvas && snapshotCanvas.parentElement) {
+        snapshotCanvas.remove();
+      }
+    };
+
     try {
-      // 기존 메모리 MSE 환경 정리
       videoEl.removeAttribute('src');
       if (activeBlobUrl) {
         URL.revokeObjectURL(activeBlobUrl);
@@ -1368,7 +1449,6 @@ $('#video').addEventListener('seeking', async () => {
       }
       activeSourceBuffer = null;
 
-      // 기존 Hls.js 인스턴스 파괴
       if (typeof hlsPlayer !== 'undefined' && hlsPlayer) {
         hlsPlayer.destroy();
         hlsPlayer = null;
@@ -1378,7 +1458,7 @@ $('#video').addEventListener('seeking', async () => {
         hlsPlayer = new Hls({
           enableWorker: true,
           lowLatencyMode: false,
-          startPosition: targetTime, // 점프한 위치의 세그먼트 우선 로드
+          startPosition: targetTime,
           maxBufferLength: 60,
           maxMaxBufferLength: 60,
           manifestLoadingTimeOut: 120000,
@@ -1392,32 +1472,35 @@ $('#video').addEventListener('seeking', async () => {
           $('#downloadStatus').textContent = '온라인 스트리밍 버퍼링 중...';
         });
 
-        // 재생 준비 완료 시 캔버스 오버레이 자동 삭제 및 재생 재개
+        // 스트리밍 재생 준비 완료 시 캡처했던 스냅샷 오버레이 제거
         videoEl.addEventListener('canplay', function onCanPlay() {
           videoEl.removeEventListener('canplay', onCanPlay);
-          
-          snapshotCanvas.remove(); // 찌꺼기 없는 깔끔한 자동 삭제
-
+          cleanupSnapshot();
           $('#downloadStatus').textContent = '온라인 스트리밍 재생 중';
-          videoEl.play().catch(err => console.warn('[HLS Transition] 재생 실패:', err));
+          videoEl.play().catch(err => console.warn('[HLS Transition] Play failed:', err));
         }, { once: true });
 
         hlsPlayer.on(Hls.Events.ERROR, (_, data) => {
           if (data.fatal) {
-            if (data.type === Hls.ErrorTypes.NETWORK_ERROR) hlsPlayer.startLoad();
-            else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hlsPlayer.recoverMediaError();
+            if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+              hlsPlayer.startLoad();
+            } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+              hlsPlayer.recoverMediaError();
+            } else {
+              cleanupSnapshot();
+            }
           }
         });
       } else {
-        snapshotCanvas.remove();
+        cleanupSnapshot();
         videoEl.src = cached.streamUrl;
         videoEl.currentTime = targetTime;
         videoEl.play();
       }
 
     } catch (e) {
-      console.error('[Cache-to-HLS Transition] 실패:', e);
-      snapshotCanvas.remove();
+      console.error('[Cache-to-HLS Transition] Failed:', e);
+      cleanupSnapshot();
       $('#downloadStatus').textContent = '스트리밍 전환에 실패했습니다.';
     }
   }
@@ -1435,25 +1518,18 @@ async function selectSubtitleTrack(track,{auto=false,notice=''}={}){
 }
 function formatTime(value){if(!Number.isFinite(value))return '00:00';const seconds=Math.max(0,Math.floor(value)),h=Math.floor(seconds/3600),m=Math.floor(seconds%3600/60),s=seconds%60;return h?`${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`:`${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`}
 function syncVolumeUI(){const video=$('#video'),control=$('.volume-control'),slider=$('#playerVolume'),muted=video.muted||video.volume===0;control.classList.toggle('muted',muted);slider.value=String(Math.round(video.volume*100));$('#mutePlayer').setAttribute('aria-label',muted?'음소거 해제':'음소거')}
-/**
- * 현재 재생 중인 영상의 전체 듀레이션(재생 시간)을 반환하는 함수
- * 1. 캐시된 회차가 있는 경우: .m3u8 파싱을 통해 미리 확보해 둔 정확한 전체 재생 시간(currentActiveDuration)을 최우선 반환합니다.
- *    (이 덕분에 150MB만 다운로드된 부분 캐시 상태에서도 타임라인 바가 전체 길이로 온전하게 표시됩니다.)
- * 2. 일반 재생 또는 캐시가 없는 경우: 비디오 태그의 기본 duration이나 HLS 플레이어의 상세 정보를 fallback으로 반환합니다.
- */
+
+// 현재 재생 중인 영상의 전체 재생 시간 반환 (확정된 캐시 듀레이션 우선 적용)
 function playbackDuration(){
-  // 1. 캐시된 회차의 전체 재생 시간이 사전에 확정되어 있다면 즉시 반환 (O(1) 연산으로 속도 저하 없음)
   if (Number.isFinite(currentActiveDuration) && currentActiveDuration > 0) {
     return currentActiveDuration;
   }
 
-  // 2. 비디오 엘리먼트 자체의 듀레이션 확인
   const video = $('#video');
   if (Number.isFinite(video.duration) && video.duration > 0) {
     return video.duration;
   }
   
-  // 3. 기존 Hls.js fallback 로직
   const details = hlsPlayer?.latestLevelDetails || 
                   hlsPlayer?.levels?.[hlsPlayer.currentLevel]?.details || 
                   hlsPlayer?.levels?.find(level => level.details)?.details;
@@ -1607,7 +1683,7 @@ $('#forwardPlayer').onclick=()=>{const seconds=Number(localStorage.getItem('seek
 $('#playerSeek').oninput=e=>{const duration=playbackDuration();if(duration)seekPlayer(duration*Number(e.target.value)/1000)};
 $('#fullscreenPlayer').onclick=async()=>{try{playerWindowFullscreen=!playerWindowFullscreen;setPlayerWindowed();await window.lilac.setPlayerFullscreen(playerWindowFullscreen)}catch(e){toast(`전체 화면 오류: ${e.message}`)}};
 //나가기 버튼을 누르는 순간 캐시 및 로그 창 완전 초기화
-$('#playerBack').onclick=async()=>{clearVideoCache();currentActiveDuration = 0;/*<-- 나갈 때 초기화*/saveHistorySoon();playbackRequestId++;window.LilacAss?.destroy();playerWindowFullscreen=false;setPlayerWindowed();setPlayerLocked(false);openPlayerSettings(false);await window.lilac.setPlayerFullscreen(false);$('#video').pause();renderContinue();renderHistory();switchView(viewBeforePlayer)};
+$('#playerBack').onclick=async()=>{HlsCacheManager.handleExit();currentActiveDuration = 0;/*<-- 나갈 때 초기화*/saveHistorySoon();playbackRequestId++;window.LilacAss?.destroy();playerWindowFullscreen=false;setPlayerWindowed();setPlayerLocked(false);openPlayerSettings(false);await window.lilac.setPlayerFullscreen(false);$('#video').pause();renderContinue();renderHistory();switchView(viewBeforePlayer)};
 $('#subtitleEnabled').onchange=e=>{const track=$('#video').textTracks[0];setVttVisible();window.LilacAss?.setVisible(e.target.checked)};
 ['mousedown','touchstart'].forEach(type=>$('#immersivePlayer').addEventListener(type,event=>{if(event.target!==$('#video'))showPlayerControls()},{passive:true}));
 $('#video').addEventListener('click',()=>{const player=$('#immersivePlayer');if(playerLocked){flashUnlockButton();return}if(playerSettingsOpen()){openPlayerSettings(false);return}if(player.classList.contains('controls-visible')){clearTimeout(controlsTimer);player.classList.remove('controls-visible')}else showPlayerControls()});
